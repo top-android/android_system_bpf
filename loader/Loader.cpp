@@ -313,7 +313,16 @@ static bool createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>
     if (getSectionSymNames(elfFile, "maps", mapNames)) return false;
 
     for (int i = 0; i < (int)mapNames.size(); i++) {
-        if (md[i].zero != 0) abort();
+        // [cannon][A17·4.14] 上游这里直接 abort()：zero 是 bpf_map_def 的布局哨兵，
+        // 非 0 说明 .o 与 Loader 的头文件不一致。4.14 上我们没法修 .o，
+        // abort() 只会让整个 loader SIGABRT 且没有任何上下文。
+        // 改成跳过这个 map 并记日志。
+        if (md[i].zero != 0) {
+            ALOGE("[cannon] map %s has non-zero padding (0x%x), skip due to layout mismatch",
+                  mapNames[i].c_str(), md[i].zero);
+            mapFds.push_back(unique_fd());
+            continue;
+        }
 
         if (kernelVer < md[i].min_kver) {
             ALOGD("skipping map %s which requires kernel version 0x%x >= 0x%x",
@@ -602,8 +611,15 @@ void vendorBpfLoader() {
         ALOGE("If this triggers randomly, you might be hitting some memory allocation "
               "problems or startup script race.");
         ALOGE("--- DO NOT EXPECT SYSTEM TO BOOT SUCCESSFULLY ---");
-        sleep(20);
-        exit(121);
+        // [cannon][A17·4.14] 4.14 上 /vendor/etc/bpf/*.o 必然加载失败，上游这里会
+        // sleep(20) 再 exit(121)。实测 ro.boottime.bpfloader→netd1shot 恰好差 20.1s，
+        // 且改加载循环毫无影响，就是这个 sleep 造成的。
+        // 4.14 降级为不等待，继续 execve "netbpfload done"，让 init 立即往下走。
+        if (android::bpf::isAtLeastKernelVersion(4, 19)) {
+            sleep(20);
+            exit(121);
+        }
+        ALOGW("[cannon] vendor BPF load failed on 4.14, skip sleep(20) and continue done");
     }
 
     const char* args[] = {"/apex/com.android.tethering/bin/netbpfload", "done", NULL};
